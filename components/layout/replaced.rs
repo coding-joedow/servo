@@ -244,7 +244,8 @@ impl ReplacedContents {
                         (None, metadata.width as f32, metadata.height as f32)
                     },
                 },
-                LayoutImageCacheResult::Pending | LayoutImageCacheResult::LoadError => return None,
+                LayoutImageCacheResult::Pending => (None, 0.0, 0.0),
+                LayoutImageCacheResult::LoadError => return None,
             };
 
             return Some(Self {

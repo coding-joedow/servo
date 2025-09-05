@@ -645,7 +645,7 @@ impl Window {
         };
         if matches!(response.response, ImageResponse::Loaded(_, _)) {
             for node in nodes.get() {
-                node.dirty(NodeDamage::Other);
+                node.dirty(NodeDamage::ReplacedContents);
             }
         }
         match response.response {

@@ -23,6 +23,7 @@ use style::values::specified::Quotes;
 use crate::context::LayoutContext;
 use crate::dom::{BoxSlot, LayoutBox, NodeExt};
 use crate::flow::inline::SharedInlineStyles;
+use crate::fragment_tree::FragmentFlags;
 use crate::quotes::quotes_for_lang;
 use crate::replaced::ReplacedContents;
 use crate::style_ext::{Display, DisplayGeneratingBox, DisplayInside, DisplayOutside};
@@ -269,12 +270,29 @@ fn traverse_pseudo_element_contents<'dom>(
                     Display::from(anonymous_info.style.get_box().display) ==
                         Display::GeneratingBox(display_inline)
                 );
+
+                let box_slot = anonymous_info.node.box_slot();
+                let slot = box_slot.slot.clone();
+
                 handler.handle_element(
                     anonymous_info,
                     display_inline,
                     Contents::Replaced(contents),
-                    anonymous_info.node.box_slot(),
-                )
+                    box_slot,
+                );
+
+                if info.pseudo_element_chain().innermost() != Some(PseudoElement::Marker) {
+                    continue;
+                }
+
+                if let Some(slot) = slot.as_ref() {
+                    if let Some(layout_box) = &mut *slot.borrow_mut() {
+                        layout_box.with_base_mut(|base| {
+                            base.base_fragment_info.flags |=
+                                FragmentFlags::IS_REPLACED_CONTENTS_OF_LIST_ITEM_MARKER;
+                        });
+                    }
+                }
             },
         }
     }
@@ -323,7 +341,7 @@ where
 }
 
 /// <https://www.w3.org/TR/CSS2/generate.html#propdef-content>
-fn generate_pseudo_element_content(
+pub(crate) fn generate_pseudo_element_content(
     pseudo_element_info: &NodeAndStyleInfo,
     context: &LayoutContext,
 ) -> Vec<PseudoElementContentItem> {

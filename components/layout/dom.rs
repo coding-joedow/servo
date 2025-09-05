@@ -22,13 +22,18 @@ use style::properties::ComputedValues;
 use style::selector_parser::{PseudoElement, RestyleDamage};
 
 use crate::cell::ArcRefCell;
+use crate::context::LayoutContext;
+use crate::dom_traversal::{
+    NodeAndStyleInfo, PseudoElementContentItem, generate_pseudo_element_content,
+};
 use crate::flexbox::FlexLevelBox;
 use crate::flow::BlockLevelBox;
 use crate::flow::inline::{InlineItem, SharedInlineStyles};
-use crate::fragment_tree::Fragment;
+use crate::fragment_tree::{Fragment, FragmentFlags};
 use crate::geom::PhysicalSize;
 use crate::layout_box_base::LayoutBoxBase;
-use crate::replaced::CanvasInfo;
+use crate::lists::make_marker;
+use crate::replaced::{CanvasInfo, ReplacedContents};
 use crate::table::TableLevelBox;
 use crate::taffy::TaffyItemBox;
 
@@ -210,6 +215,35 @@ impl LayoutBox {
         }
     }
 
+    fn repair_replaced_contents(&self, new_contents: ReplacedContents) {
+        match self {
+            LayoutBox::BlockLevel(block_level_box) => {
+                block_level_box
+                    .borrow_mut()
+                    .repair_replaced_contents(new_contents);
+            },
+            LayoutBox::InlineLevel(inline_items) => {
+                if let Some(inline_level_box) = inline_items.first() {
+                    inline_level_box
+                        .borrow()
+                        .repair_replaced_contents(new_contents);
+                }
+            },
+            LayoutBox::FlexLevel(flex_level_box) => flex_level_box
+                .borrow_mut()
+                .repair_replaced_contents(new_contents),
+            LayoutBox::TaffyItemBox(taffy_item_box) => taffy_item_box
+                .borrow_mut()
+                .repair_replaced_contents(new_contents),
+            LayoutBox::TableLevelBox(_) => {
+                unreachable!("Called repair_replaced_contents on a table box")
+            },
+            LayoutBox::DisplayContents(..) => {
+                unreachable!("Called repair_replaced_contents on a display: contents box")
+            },
+        }
+    }
+
     /// If this [`LayoutBox`] represents an unsplit (due to inline-block splits) inline
     /// level item, unwrap and return it. If not, return `None`.
     pub(crate) fn unsplit_inline_level_layout_box(self) -> Option<ArcRefCell<InlineItem>> {
@@ -304,6 +338,7 @@ pub(crate) trait NodeExt<'dom> {
     fn clear_fragment_layout_cache(&self);
 
     fn repair_style(&self, context: &SharedStyleContext);
+    fn repair_replaced_contents(&self, context: &LayoutContext);
     fn take_restyle_damage(&self) -> LayoutDamage;
 }
 
@@ -471,6 +506,126 @@ impl<'dom> NodeExt<'dom> for ServoThreadSafeLayoutNode<'dom> {
     fn repair_style(&self, context: &SharedStyleContext) {
         if let Some(layout_data) = self.inner_layout_data() {
             layout_data.repair_style(self, context);
+        }
+    }
+
+    fn repair_replaced_contents(&self, context: &LayoutContext) {
+        if !self.pseudo_element_chain().is_empty() {
+            return;
+        }
+
+        let Some(layout_data) = self.inner_layout_data() else {
+            return;
+        };
+
+        let is_replaced_contents = |layout_box: &LayoutBox| {
+            layout_box
+                .with_base_flat(|base| {
+                    vec![
+                        base.base_fragment_info
+                            .flags
+                            .contains(FragmentFlags::IS_REPLACED),
+                    ]
+                })
+                .into_iter()
+                .next()
+                .unwrap_or(false)
+        };
+
+        let is_replaced_contents_of_list_item_marker = |layout_box: &LayoutBox| {
+            layout_box
+                .with_base_flat(|base| {
+                    vec![
+                        base.base_fragment_info
+                            .flags
+                            .contains(FragmentFlags::IS_REPLACED_CONTENTS_OF_LIST_ITEM_MARKER),
+                    ]
+                })
+                .into_iter()
+                .next()
+                .unwrap_or(false)
+        };
+
+        let repair_marker_replaced_contents =
+            |context: &LayoutContext, parent_info: &NodeAndStyleInfo, layout_box: &LayoutBox| {
+                let Some((_, marker_contents)) = make_marker(context, parent_info) else {
+                    return;
+                };
+
+                let Some(marker_content) = marker_contents.into_iter().next() else {
+                    return;
+                };
+
+                let new_contents = match marker_content {
+                    PseudoElementContentItem::Replaced(new_contents) => new_contents,
+                    _ => return,
+                };
+
+                layout_box.repair_replaced_contents(new_contents);
+            };
+
+        if let Some(layout_box) = &*layout_data.self_box.borrow() {
+            if is_replaced_contents(layout_box) {
+                let new_contents = ReplacedContents::for_element(self.clone(), context)
+                    .expect("Element with replaced contents box should still be replaced");
+                layout_box.repair_replaced_contents(new_contents);
+                return;
+            }
+        }
+
+        let node_and_style_info = NodeAndStyleInfo::new(
+            self.clone(),
+            self.style(&context.style_context),
+            self.take_restyle_damage(),
+        );
+
+        for primary_pseudo_layout_data in layout_data.pseudo_boxes.iter() {
+            if let Some(layout_box) = &*primary_pseudo_layout_data.data.borrow().self_box.borrow() {
+                if is_replaced_contents_of_list_item_marker(layout_box) {
+                    repair_marker_replaced_contents(context, &node_and_style_info, layout_box);
+                    continue;
+                }
+            }
+
+            if primary_pseudo_layout_data.pseudo.is_before_or_after() {
+                let Some(primary_pseudo_info) = node_and_style_info
+                    .with_pseudo_element(context, primary_pseudo_layout_data.pseudo)
+                else {
+                    continue;
+                };
+
+                let mut pseudo_replaced_contents =
+                    generate_pseudo_element_content(&primary_pseudo_info, context)
+                        .into_iter()
+                        .filter(|item| matches!(item, PseudoElementContentItem::Replaced(_)));
+
+                let secondary_pseudo_layout_datas = primary_pseudo_layout_data.data.borrow();
+                for secondary_pseudo_layout_data in
+                    secondary_pseudo_layout_datas.pseudo_boxes.iter()
+                {
+                    let secondary_inner_layout_data = secondary_pseudo_layout_data.data.borrow();
+                    let Some(layout_box) = &*secondary_inner_layout_data.self_box.borrow() else {
+                        continue;
+                    };
+
+                    if is_replaced_contents_of_list_item_marker(layout_box) {
+                        repair_marker_replaced_contents(context, &primary_pseudo_info, layout_box);
+                        continue;
+                    }
+
+                    if is_replaced_contents(layout_box) {
+                        let Some(new_contents) = pseudo_replaced_contents.next() else {
+                            continue;
+                        };
+
+                        let PseudoElementContentItem::Replaced(new_contents) = new_contents else {
+                            continue;
+                        };
+
+                        layout_box.repair_replaced_contents(new_contents);
+                    }
+                }
+            }
         }
     }
 

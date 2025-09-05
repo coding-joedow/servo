@@ -181,7 +181,8 @@ bitflags! {
         /// Whether or not this is a table cell that is part of a collapsed row or column.
         /// In that case it should not be painted.
         const IS_COLLAPSED = 1 << 11;
-
+        /// Whether or not this Fragment was created to contain a list item marker's replaced contents.
+        const IS_REPLACED_CONTENTS_OF_LIST_ITEM_MARKER = 1 << 12;
     }
 }
 
